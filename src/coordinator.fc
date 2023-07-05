@@ -1,0 +1,185 @@
+
+#include "ecvrf.fc";
+
+(int, slice) load_bounced_sender(cell in_msg) inline {
+  slice in_msg = in_msg.begin_parse();
+  int b = in_msg~load_uint(4) & 1;
+  return (b, in_msg~load_msg_addr());
+}
+
+() terminate()          impure asm "RETALT";
+() terminate_if(int)    impure asm "IFRETALT";
+
+(slice, int) dict_get?(cell dict, int key_len, slice index) asm(index dict key_len) "DICTGET" "NULLSWAPIFNOT";
+(cell, (slice, slice)) ~dict_delgetmin(cell dict, int key_len) asm "DICTREMMIN" "150 THROWIFNOT";
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+const int milliton = 1000000;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+{-
+    subscriptions: map<Address, Int as uint64>;
+    unfulfilled_requests: Int as uint64;
+    subscribed_contracts: Int as uint8;
+    tier: Int as uint16;
+    
+    owner: Address;
+    public_key_ecvrf: Int as uint256;
+    public_key_replay: Int as uint256;
+    last_rand_unixtime: Int as uint32;
+-}
+
+(cell, int, int, int, slice) load_subscriptions_other() inline {
+    slice ds = get_data().begin_parse();
+    return (ds~load_dict(), ds~load_uint(64), ds~load_uint(8), ds~load_uint(16), ds);
+}
+() save_subscriptions_other(cell subscriptions, int unfulfilled_requests,
+        int subscribed_contracts, int tier, slice other) impure inline {
+    set_data(begin_cell().store_dict(subscriptions).store_uint(unfulfilled_requests, 64)
+        .store_uint(subscribed_contracts, 8).store_uint(tier, 16).store_slice(other).end_cell());
+}
+
+(int, int, slice) load_unfulfilled_tier_owner() inline {
+    slice ds = get_data().begin_parse().skip_dict();
+    int unfulfilled_requests = ds~load_uint(64);
+    ds~skip_bits(8);
+    return (unfulfilled_requests, ds~load_uint(16), ds~load_msg_addr());
+}
+;; no need to save anything, as withdraw request doesn't modify the contract
+
+([cell, int, int, int], slice, int, int, int) load_contract() inline {
+    (cell s, int ur, int sc, int tier, slice other) = load_subscriptions_other();
+    return (tuple4(s, ur, sc, tier), other~load_msg_addr(), other~load_uint(256),
+        other~load_uint(256), other~load_uint(32));
+}
+() save_subscriptions_time((cell, int, int, int) subscription_info) impure inline {
+    slice ds = get_data().begin_parse();
+    ds~skip_last_bits(32);
+    (cell s, int ur, int sc, int tier) = subscription_info;
+    set_data(begin_cell().store_dict(s).store_uint(ur, 64).store_uint(sc, 8).store_uint(tier, 16)
+        .store_slice(ds.slice_last(267 + 512)).store_uint(now(), 32).end_cell());
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; op::subscribe_random#AB4C4859 consumer:MsgAddressInt = InMsgBody;
+;; op::withdraw#CB03BFAF = InMsgBody;
+
+() recv_internal(int msg_balance, cell in_msg, slice in_msg_body) {
+    terminate_if(in_msg_body.slice_bits() < 32);
+    
+    (int bounced, slice sender) = in_msg.load_bounced_sender();
+    terminate_if(bounced);
+    
+    int op = in_msg_body~load_uint(32);
+    if (op == 0xAB4C4859) {
+        (cell subscriptions, int unfulfilled_requests, int subscribed_contracts,
+         int tier, slice other) = load_subscriptions_other();
+        
+        int added_messages = (msg_balance - 10 * milliton) / ((60 + tier) * milliton);
+        terminate_if(added_messages <= 0);
+        
+        slice consumer = in_msg_body~load_msg_addr();
+        (slice messages, int already_subscribed) = subscriptions.dict_get?(267, consumer);
+        
+        if (~ already_subscribed) {
+            subscribed_contracts += 1;
+            throw_if(170, subscribed_contracts > 255);
+        } else {
+            added_messages += messages.preload_uint(64);
+        }
+        
+        unfulfilled_requests += added_messages;
+        subscriptions~dict_set_builder(267, consumer, begin_cell().store_uint(added_messages, 64));
+        save_subscriptions_other(subscriptions, unfulfilled_requests, subscribed_contracts,
+            tier, other);
+    } elseif (op == 0xCB03BFAF) {
+        (int unfulfilled_requests, int tier, slice owner) = load_unfulfilled_tier_owner();
+        throw_unless(171, equal_slices(sender, owner));
+        
+        raw_reserve((50 + tier) * milliton * unfulfilled_requests, 0);
+        send_raw_message(begin_cell()
+          .store_uint(0x18, 6)
+          .store_slice(owner)
+          .store_coins(0)
+          .store_uint(0, 107)
+          .end_cell(), 128);
+    }
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+builder get_alpha_b() inline {
+    slice ds = get_data().begin_parse();
+    int extra_bits = ds.slice_bits() % 8;
+    return begin_cell()
+      .store_uint(ds.preload_uint(extra_bits), 8)
+      .store_uint(get_data().cell_hash(), 256);
+}
+
+slice get_alpha() inline method_id {
+    return get_alpha_b().end_cell().begin_parse();
+}
+
+int get_unfulfilled() method_id {
+    (cell s, int ur, int sc, int tier, slice other) = load_subscriptions_other();
+    return ur;
+}
+int get_subscribers() method_id {
+    (cell s, int ur, int sc, int tier, slice other) = load_subscriptions_other();
+    return sc;
+}
+int get_tier() method_id {
+    (cell s, int ur, int sc, int tier, slice other) = load_subscriptions_other();
+    return tier;
+}
+int get_requests_cost(int n) method_id {
+    (cell s, int ur, int sc, int tier, slice other) = load_subscriptions_other();
+    return (60 + tier) * milliton * n + 10 * milliton;
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; op::provide_proved_random#_ contract_sig:^bits512 pi:Slice = ExternalInMsgBody;
+;; op::provide_random#069CECA8 rnd:u256 = OutMsgBody;
+
+() recv_external(slice pi) {
+    (var subs_info, slice owner, int public_key_ecvrf, int public_key_replay, int last_rand_unix) = load_contract();
+    throw_unless(130, now() > last_rand_unix);
+
+    slice sig = pi~load_ref().begin_parse();
+    throw_unless(131, check_signature(get_data().cell_hash(), sig, public_key_replay));  ;; the message was produced by oracle
+    accept_message();
+
+    builder alpha_b = get_alpha_b();
+    save_subscriptions_time(untuple4(subs_info));  ;; replay protection
+    int rnd = ecvrf::rist255::verify_and_hash(public_key_ecvrf, alpha_b, pi);  ;; proved that oracle not cheats
+    cell cur_random = begin_cell().store_uint(0x069CECA8, 32).store_uint(rnd, 256).end_cell();  ;; for broadcasting
+    
+    (cell cur_subs, int pending_requests, int subscribers, int tier) = untuple4(subs_info);
+
+    cell new_subs = new_dict();
+    pending_requests -= subscribers;
+    repeat(subscribers) {
+        (slice remaining_messages, slice consumer) = cur_subs~dict_delgetmin(267);
+        int remaining = remaining_messages.preload_uint(64);
+        
+        if (remaining > 1) {
+            new_subs~dict_set_builder(267, consumer, begin_cell().store_uint(remaining - 1, 64));
+        } else {
+            subscribers -= 1;
+        }
+        
+        send_raw_message(begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(consumer)
+            .store_coins(30 * milliton)
+            .store_uint(1, 107)
+            .store_ref(cur_random)
+            .end_cell(), 2);
+    }
+    
+    save_subscriptions_time((new_subs, pending_requests, subscribers, tier));
+}

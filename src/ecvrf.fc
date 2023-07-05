@@ -1,0 +1,86 @@
+;; https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-vrf-15#name-elliptic-curve-vrf-ecvrf
+;; based on new TVM opcodes
+
+const int curve_bit_len = 256;
+const int challenge_len = 128;
+const int challenge_mod = 1 << 128;
+
+() rist255::validate_pkey(int public_key) impure asm "RIST255_VALIDATE";
+int rist255::qvalidate_pkey(int public_key) asm "RIST255_QVALIDATE";
+int rist255::sha512::hash_and_curve(builder data) asm "ONE HASHEXT_SHA512 UNPAIR RIST255_FROMHASH";
+int rist255::multiply(int point, int value) asm "RIST255_MUL";
+int rist255::base(int value) asm "RIST255_MULBASE";
+int rist255::add(int, int) asm "RIST255_ADD";
+int rist255::sub(int, int) asm "RIST255_SUB";
+int rist255::order() asm "RIST255_PUSHL";
+
+int sha256::hash_one(builder a) asm "ONE HASHEXT_SHA256";
+int sha256::hash_two(builder a, builder b) asm "TWO HASHEXT_SHA256";
+
+int ecvrf::rist255::encode_to_curve(builder alpha) inline {
+    return begin_cell()
+        .store_uint("ton.experimental.ratelance.ecvrf"H, 256)
+        .store_builder(alpha)
+        .store_uint("ecvrf.encodecurve.back"H, 256)
+        .rist255::sha512::hash_and_curve();
+}
+
+int ecvrf::rist255::generate_challenge(int y_point, int h_point, int gamma_point,
+        int u_point, int v_point) inline {
+    return sha256::hash_two(
+         begin_cell()
+        .store_uint(y_point, 256)
+        .store_uint(h_point, 256)
+        .store_uint(gamma_point, 256),
+         begin_cell()
+        .store_uint(u_point, 256)
+        .store_uint(v_point, 256)) % challenge_mod;
+}
+
+int ecvrf::rist255::verify_and_hash(int public_key, builder alpha, slice pi) inline method_id {
+    ;; rist255::validate_pkey(public_key);    ;; we don't need to recheck the key on each external message
+    int gamma = pi~load_uint(curve_bit_len);  ;; curve point
+    rist255::validate_pkey(gamma);
+    int c = pi~load_uint(challenge_len);
+    int s = pi~load_uint(curve_bit_len);
+    int h = alpha.ecvrf::rist255::encode_to_curve();
+    int V = rist255::sub(h.rist255::multiply(s), gamma.rist255::multiply(c));
+    int U = rist255::sub(rist255::base(s), public_key.rist255::multiply(c));
+    int c' = ecvrf::rist255::generate_challenge(public_key, h, gamma, U, V);
+    throw_unless(100, c == c');
+    return begin_cell()
+        .store_uint("ton.experimental.ratelance.ecvrf"H, 256)
+        .store_uint(gamma, 256)
+        .store_uint("ecvrf.beta.back"H, 256)
+        .sha256::hash_one();
+}
+
+int ecvrf::rist255::with_secret::generate_nonce(int secret, int h_point) inline {
+    return begin_cell()
+        .store_uint(
+            begin_cell().store_uint(secret, 256).sha256::hash_one() >> 128,
+            128
+        )
+        .store_uint(h_point, curve_bit_len)
+        .sha256::hash_one() % rist255::order();
+}
+
+int rist255::get_public_key(int secret) method_id {
+    return rist255::base(secret);
+}
+
+slice ecvrf::rist255::with_secret::prove(int secret, slice alpha) method_id {
+    int public_key = rist255::base(secret);
+    int h = begin_cell().store_slice(alpha).ecvrf::rist255::encode_to_curve();
+    int gamma = h.rist255::multiply(secret);
+    int k = ecvrf::rist255::with_secret::generate_nonce(secret, h);
+    int c = ecvrf::rist255::generate_challenge(public_key, h, gamma,
+        rist255::base(k), h.rist255::multiply(k));
+    int s = (k + c * secret) % rist255::order();
+    return begin_cell()
+        .store_uint(gamma, curve_bit_len)
+        .store_uint(c, challenge_len)
+        .store_uint(s, curve_bit_len)
+        .end_cell()
+        .begin_parse();
+}
