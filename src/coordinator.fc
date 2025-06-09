@@ -1,4 +1,18 @@
 
+;; Coordinator contract for ECVRF (on experimental configuration).
+;;
+;; * When deploying it, owner decided on a "tier" - basically, a price premium. Their oracle server
+;;     might be prioritizing the coordinators with higher tier.
+;; * To receive `N` messages with 256 bits of randomness to address `consumer`, one must send
+;;     `op::subscribe_random#AB4C4859 consumer:MsgAddressInt = InMsgBody` with 10mT + N*(60+tier)mT,
+;;     "mT" meaning one milliTON (1'000'000 indivisible units).
+;; * Whenever oracle sees fit - in most cases, within a few seconds - it loads `alpha` (the entropy
+;;     for generating a number), computes elliptic-curve verified random function and sends that
+;;     back to coordinator. The contract then broadcasts ONE AND THE SAME `op::provide_random` to
+;;     all its subscribers, and reduces their remaining message counter by one.
+;; * Coordinator's `alpha` can be influenced by subscribing.
+;; (c) ProgramCrafter, 2025
+
 #include "ecvrf.fc";
 
 (int, slice) load_bounced_sender(cell in_msg) inline {
@@ -80,6 +94,7 @@ const int milliton = 1000000;
         
         int added_messages = (msg_balance - 10 * milliton) / ((60 + tier) * milliton);
         terminate_if(added_messages <= 0);
+        unfulfilled_requests += added_messages;
         
         slice consumer = in_msg_body~load_msg_addr();
         (slice messages, int already_subscribed) = subscriptions.dict_get?(267, consumer);
@@ -91,7 +106,6 @@ const int milliton = 1000000;
             added_messages += messages.preload_uint(64);
         }
         
-        unfulfilled_requests += added_messages;
         subscriptions~dict_set_builder(267, consumer, begin_cell().store_uint(added_messages, 64));
         save_subscriptions_other(subscriptions, unfulfilled_requests, subscribed_contracts,
             tier, other);
